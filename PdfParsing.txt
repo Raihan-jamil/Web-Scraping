@@ -1,0 +1,342 @@
+package current_scripts
+
+import com.rdc.importer.scrapian.ScrapianContext
+import com.rdc.importer.scrapian.model.StringSource
+import com.rdc.importer.scrapian.util.ModuleLoader
+import com.opencsv.CSVWriter
+import com.rdc.scrape.ScrapeAddress
+import com.rdc.scrape.ScrapeEvent
+
+context.setup([connectionTimeout: 20000, socketTimeout: 25000, retryCount: 1, multithread: true, userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3770.80 Safari/537.36"])
+context.session.encoding = "UTF-8" //change it according to web page's encoding
+context.session.escape = true
+
+PdfParsing script = new PdfParsing(context)
+script.initParsing()
+
+class PdfParsing {
+    ScrapianContext context
+    def moduleLoaderVersion = context.scriptParams.moduleLoaderVersion
+    final def moduleFactory = ModuleLoader.getFactory(moduleLoaderVersion)
+    final entityType
+    final def ocrReader
+    def addressParser
+
+    PdfParsing(context) {
+        this.context = context
+        ocrReader = moduleFactory.getOcrReader(context)
+        addressParser = moduleFactory.getGenericAddressParser(context)
+        entityType = moduleFactory.getEntityTypeDetection(context)
+    }
+
+    def initParsing() {
+        def pages = pdfToTextConverter("https://www.bis.doc.gov/index.php/documents/regulations-docs/2713-supplement-no-6-to-part-744-unverified-list/file")
+
+        pages = dataSanitize(pages)
+        pages = fixingData(pages)
+        handleData(pages)
+    }
+
+    def handleData(pages) {
+        def writer = new CSVWriter(new FileWriter('PdfOutput.csv'))
+        def header = ['Main Entity Name', 'Date', 'Address', 'Alias']
+        writer.writeNext(header as String[])
+        //println(pages)
+        def rowMatcher = pages =~ /(?sm)^(.+?(?:\d{1,}\\/\d{1,}\\/\d{2,}|\w+\s\d{1,},\s\d{2,}|\w+\s\d{1,},\s*\d{2,}))(?:;|\.)*$/
+
+        def rowData
+        while (rowMatcher.find()) {
+            rowData = rowMatcher.group(1)
+            rowData = rowFixing(rowData)
+
+            //println("*********\n" + rowData)
+
+            def name
+            def address
+            def alias
+            def date
+
+            def nameMatcher = rowData =~ /(?sm)^(.+?\w+.+?)(\n|,)(.+?)(\d{1,}\/\d{1,}\/\d{2,}|\w+\s\d{1,},\s\d{2,})(?:;|\.)*$/
+            def dateMatcher = rowData =~ /(?s)(\d{1,}\/\d{1,}\/\d{2,}|\w{3,}\s\d{1,},\s\d{4})/
+
+            while (nameMatcher.find() && dateMatcher.find()) {
+                name = nameMatcher.group(1).replaceAll(/a\.k\.a\./," ").trim()
+                address = nameMatcher.group(3).trim()
+
+                date = dateMatcher.group(1).trim()
+                date = date.toString().replaceAll(/Tower 1, 17|Flat 01, 25|Room 1203, 12|Unit 22, 10|Room 1019, 10|Flat 1205, 12|Phase 2, 460|Tower 2, 89|Room 1101, 11|Rm 2309, 23|Unit 5, 27|Workshop 12, 13|Flat 6, 20|Tower 2, 89|Room 1609, 16|Rm 2309, 23/, "")
+
+                println("date:~~~~" + date)
+
+                println("Name:~~~~" + name)
+
+                println("address: " + address)
+                def aliasMatcher = address =~ /(?s)(a\.?k\.?a\.?,? .\s{3,}.+?,|a\.?k\.?a\.?,? .*?\s{3,})/
+
+                if(aliasMatcher.find()) {
+                    alias = aliasMatcher.group(0)
+                    alias = alias.toString().replaceAll(/a\.k\.a\./, "")
+                    alias = alias.toString().replaceAll(/aka/, "")
+                    println("Alias:~~~~" + alias)
+                }
+                address = address.toString().replaceAll(/(?s)a\.?k\.?a\.?,? .*?\s{3,}/, "")
+                address = address.toString().replaceAll(/(?s)\s{2,}/, " ").trim()
+
+
+                createEntity(name, date, address, alias)
+
+//                def data = [] as List
+//                data.add(name)
+//                data.add(date)
+//                data.add(address)
+//                data.add(alias)
+//                writer.writeNext(data as String[])
+            }
+
+        }
+        writer.close()
+    }
+
+    def rowFixing(def row) {
+        row = row.toString().replaceAll(/, Ltd./, " Ltd.")
+        return row
+    }
+
+    def pdfToTextConverter(def pdfUrl) {
+        def pdfFile = invokeBinary(pdfUrl)
+        def pmap = [:] as Map
+        pmap.put("1", "-layout")
+        pmap.put("2", "-enc")
+        pmap.put("3", "UTF-8")
+        pmap.put("4", "-eol")
+        pmap.put("5", "dos")
+        //pmap.put("6", "-raw")
+        def pdfText = context.transformPdfToText(pdfFile, pmap)
+        return pdfText
+    }
+
+    def invokeBinary(url, type = null, paramsMap = null, cache = true, clean = true, miscData = [:]) {
+        Map dataMap = [url: url, type: type, params: paramsMap, clean: clean, cache: cache]
+        dataMap.putAll(miscData)
+        return context.invokeBinary(dataMap)
+    }
+
+    def dataSanitize(def data) {
+        data = data.toString().replaceAll(/(?ism)(SUPPLEMENT NO. 6 TO PART 744).+?$/, "")
+        data = data.toString().replaceAll(/(?ism)(Exports.+?EAR.)/, "")
+        data = data.toString().replaceAll(/(?ism)(Export Administration Regulations|Bureau of Industry and Security|March 24, 2023|Unverified List)/, "")
+        data = data.toString().replaceAll(/(?ism)(COUNTRY|LISTED PERSON AND ADDRESS|FEDERAL|REGISTER|CITATION)/, "")
+        data = data.toString().replaceAll(/(?s)\d{2}\sFR\s\d{5},|87 FR 7039,|80 FR 4781,|80 FR 4779,|80 FR 4779/, "")
+        data = data.toString().replaceAll(/(\d{1,}\/\d{1,}\/\d{2,})(\.)/, '$1')
+        data = data.toString().replaceAll(/(?s)\s\s(ARMENIA|AZERBAIJAN|BULGARIA|CANADA|CHINA,|PEOPLE’S|REPUBLIC OF|CZECH|UNITED ARAB|EMIRATES|REPUBLIC|SWITZERLAND|TURKEY|RUSSIA|SAUDI ARABIA|SINGAPORE|PAKISTAN|FINLAND|GEORGIA|GERMANY|INDIA|INDONESIA|ISRAEL|LATVIA|LEBANON|MALAYSIA|ESTONIA)\s\s/, "")
+        data = data.toString().replaceAll(/(?s)(\d{2},\s\d{4})(\.)/, '$1')
+        data = data.toString().replaceAll(//, "")
+        return data
+    }
+
+    def fixingData(def data) {
+
+// For Date Fixing
+        data = data.toString().replaceAll(/(?s)(Laval.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+3E9, Canada)/, { def a, b, c, d, e, f, g, h -> return b + d + f + h + "       " + c + ";" + e + ";" + g })
+        //data = data.toString().replaceAll(/(?s)(Atlas.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?)(\d{1,}\/\d{1,}\/\d{2,})/, { def a, b, c, d, e, f, g -> return b + d + f + "        " + c + ";" + e + ";" + g })
+        data = data.toString().replaceAll(/(?ism)(caspian.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Azerbaijan)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?ism)(AECC.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Airpart.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Hong Kong)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(ARI.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(AW Industrial Ltd..+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Tong, Hong Kong)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Chang.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(China\sNational.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Province,\sChina.)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Chongqing\sXinyuhang.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?401135,\sChina)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Chongqing\sOptel.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Chengde.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?City, China 067506)/, { def a, b, c, d -> return b + d + "        " + c })
+        data = data.toString().replaceAll(/(?is)(Able Supply Chain.+?)(April)(.+?)( \d{1,},\s\d{4,})(.+?Sheung.+?Hong Kong)/, { def a, b, c, d, e, f -> return b + d + f + "     " + c + e })
+        data = data.toString().replaceAll(/(?is)(Beijing\sPowerMac.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Beijing,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Beijing\sSWT.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina.)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Beijing\sZhonghehangxun.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Beijing,\sChina.)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Boqur.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Chai,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Boson.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Chai,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(CST.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Kowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Dandong.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+? China)/, { def a, b, c, d -> return b + d + "     " + c })
+        //data = data.toString().replaceAll(/(?is)(Daystar\sElectric.+?)(\w+\s\d{2},\s\d{4})(.+?Wanchai.+?Hong Kong)/, {def a, b, c, d -> return b + d + "     " + c})
+        //  data = data.toString().replaceAll(/(?is)(Dongguan Huiqu.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(DK\sLaser.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(ECOM International.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Street.+?Hong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+
+        data = data.toString().replaceAll(/(?is)(Emax.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Admiralty,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Fortune.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Bay,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Globe.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Sheung Wan,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Guangdong.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(GRG\sMetrology.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?China)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Guangdong\sGuanghua.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+
+//        println("ok")
+        data = data.toString().replaceAll(/(?is)(Guangzhou\sGRG.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Beijing,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(HK Hengyu Storage .+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?B11.+?Hong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(HK\sP&W.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Chai,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Guangzhou\sTrusme.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?N.T.,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Gucheng\sXian.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China\s253800)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Harbin\sXinguang.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Hong\sKong.+?)(\w+\s\d{2},\s\d{4})(.+?New.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Hongbo\sIndustrial.+?)(\w+\s\d{2},\s\d{4})(.+?Road,\sKowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+//        data = data.toString().replaceAll(/(?is)(Huaduan.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Suzhou,\sChina)/,{def a,b,c,d->return b+d+"     "+c})
+        data = data.toString().replaceAll(/(?is)(Hunan\sUniversity.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina.)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Jialin\sPrecision.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?201112,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Jiangsu\sHNHB.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Jin\sYan.+?)(\w+\s\d{2},\s\d{4})(.+?Kowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Jinan\sBodor.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Kenwoo\sInternational.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Chung,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Kesina\sServices.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Wan,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Lightstar\sTechnology.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Territories.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Ling Ao Ele.+?)(\s+\w+\s\d{2},\s\d{4};)(.+?)(\w+\s\d{1,},\s\d{4};)(.+?)(\w+\s\d{1,},\s\d{4};)(.+?)(\w+\s\d{1,},\s\d{4};)(.+?)(\w+\s\d{1,},\s\d{4})(.+?Kowloon,.+?Kwun\sTong,\sHong Kong)/, { def a, b, c, d, e, f, g, h, i, j, k, l -> return b + d + f + h + j + l + "    " + c + "" + e + "" + g + "" + i + "" + k })
+        data = data.toString().replaceAll(/(?is)(Luoyang\sWeimi.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China\s471000)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Lianqi.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Lishui\sZhengyang.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Lishui,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Nanjing\sGova.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Nano\sTech.+?)(\w+\s\d{2},\s\d{4})(.+?Kowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Ningbo\sIII.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?315803,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        //println(data)
+        data = data.toString().replaceAll(/(?is)(Narpel\sTechnology.+?)(\w+\s\d{2},\s\d{4};)(.+?)(\w+\s\d{2},\s\d{4};)(.+?)(\w+\s\d{1,},\s\d{4}.)(.+?wan\sChai,\sHong Kong)/, { def a, b, c, d, e, f, g, h -> return b + d + f + h + "      " + c + "" + e + "" + g })
+        data = data.toString().replaceAll(/(?is)(Powersun\sElectronics.+?)(\w+\s\d{2},\s\d{4};)(.+?)(\w+\s\d{2},\s\d{4})(.+?Territories,\sHong Kong)/, { def a, b, c, d, e, f -> return b + d + f + "      " + c + "" + e })
+        data = data.toString().replaceAll(/(?is)(Rising\sLogistics.+?)(\w+\s\d{2},\s\d{4})(.+?)(.+?Island,\sHong Kong)/, { def a, b, c, d, e -> return b + d + e + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shaanxi\sHongyuan.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China\s713801)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shandong\sYuehaitongxin.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Territories.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shanghai\sInstitute.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Shanghai,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shengwei\sTechnology.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?N.T.,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shenzhen\sWinthought.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Shenzhen,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Shuang\sXiang.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?350300,\sChina.)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sino\sSuperconductor.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Beijing,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Small\sLeopard.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Kowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sunway\sTechnology.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Kong,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sur-Link\sTechnology.+?)(\w+\s\d{2},\s\d{4})(.+?Territories,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Suzhou\sChaowei.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Jiangsu,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Suzhou\sSen-Chuan.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?215155,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Selective\sComponents.+?)(\w+\s\d{2},\s\d{4})(.+?Territories,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        //println(data)
+        data = data.toString().replaceAll(/(?is)(Solar\sWay.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Hong\sKong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sun\sWing.+?)(\w+\s\d{2},\s\d{4})(.+?Hong\sKong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(TRI\sMicrosystems.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Shenzhen,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Tianjin\sOptical.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?30400,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Toptech\sElectronics.+?)(\w+\s\d{2},\s\d{4})(.+?TRI\sMicrosystems)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(USETA\sTech.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Hong\sKong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Wuhan\sInstitute.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?430207,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Winners\sGlobal.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Wuxi\sBeetech.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Wuxi,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Wuxi\sHengling.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?214131,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Xian\sZhongsheng.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?710000,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Xiang\sCheng.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Territories,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Xinjiang\sEast.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Xinjiang,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Yashen.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?Kowloon.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Yield\sBest.+?)(\w+\s\d{2},\s\d{4})(.+?Tong,\sHong kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Yunnan.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Zhengzhou\sBaiwai.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Province,\sChina)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(ZhongJie\sElectronics.+?)(\w+\s\d{2},\s\d{4})(.+?Kowloon,\sHong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Bonitopto.+?\s+.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Jachymovska.+?Republic)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Intertranslog\sOY.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?53301\sFinland)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Spars\sLtd.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Georgia,\s0183)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sav-Inter\sOY.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Finland)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Universal\sLogistics.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Germany)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Conduit\sTechnologies.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?City.+?India)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Alfa\sPhotonics.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Jurkalnes.+?Latvia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Al\sGhayth.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Beirut.+?Lebanon)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Golden\sGamp.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?47810\sMalaysia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Infomaya\sTech.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Kuala Lumpur,\sMalaysia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Premier\sKiosk.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Malaysia\s50450)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Andleeb\sAssociates.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Rawalpindi,\sPakistan)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(T.M.A.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Iqbal Town, Lahore,\sPakistan)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(EFO\sLtd.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Petersburg,\sRussia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(JSC\sVoentelecom.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Moscow,\sRussia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Al\sGihaz.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Medina,\sSaudi Arabia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Dorado\sNetwork.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Drive.+?Singapore)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Smart\sCakrawala.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?E,\sSingapore)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Light\sRange.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Figino,\sSwitzerland)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Üçüzler\sLojistik.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Turkey\s31500)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Abu\sTrade.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Aero\sKing.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Khaimah,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Alsaroud\sGeneral.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Al Jubail, Sharjah,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Alsima\sMiddle.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(EBN\sAUF.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Box\s42558)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Elemental.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Baniyas Square, Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Empire\sof.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Sheikh.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Establishment\sStandard.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Box.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Golden\sBusiness.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Box.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Gulf.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Kassem\sIT.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?06.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Lavender.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?City, Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Marinatec.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Deira, Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Masomi.+?\s+.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Middle\sEast.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Flat.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Pacific\sOcean.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?707.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Recaz\sStar.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Rich\sStar.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Box\s181977)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Rising\sSun.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        //println(data)
+        data = data.toString().replaceAll(/(?is)(Roudah\sAl.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?402.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Sea\sPrince.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Maritime.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Tek\sWork.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Business.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Trade\sStar.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Sharjah.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(World\sHeavy.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Khaimah,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Blue\sWing.+?)(\d{1,}\\/\d{1,}\\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Delma\sIndustrial.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Dhabi,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Diamond\sRiver.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Doubair\sGeneral.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Renat\sInternational.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Behind.+?UAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Rich\sStar.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Dubai,\sUAE)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(ZDAS.+?\s+.+?)(\w+\s\d{2},\s\d{4})(.+?New.+?Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(CNG\sLabs.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Shemona,\sIsrael)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Radiofizika\sOAO.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?125363,\sRussia)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(BLC\sHavacilik.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Ankara,\sTurkey)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Odak\sKimya.+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?Istanbul,\sTurkey)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?s)(Brilliance\sTechnology.+?)(\w+\s\d{1,},\s\d{4};)(.*?)(\w+\s\d{1,},\s\d{4})(.+?Tei.+?Hong Kong)/, { def a, b, c, d, e, f -> return b + d + f + "      " + c + "" + e })
+        data = data.toString().replaceAll(/(?is)(Daystar\sElectric.+?)(\w+\s\d{2},\s\d{4})(.+?Wanchai.+?Hong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        data = data.toString().replaceAll(/(?is)(Dongguan Huiqun .+?)(\d{1,}\/\d{1,}\/\d{2,})(.+?China\.)/, '$1 $3            $2')
+        //data = data.toString().replaceAll(/(?is)(E-Chips\sTechnology.+?)(\s\s+)(\w+\s\d{2},\s\d{4};)(.*?)(\w+\s\d{2},\s\d{4};)(.+?)(and\sFlat.+?kong)(\s\s+)(\w+\s\d,\s\d{4}.)/,{def a,b,c,d,e,f,g,h,i,j-> return b+" "+h+i+d+f+j})
+        //data = data.toString().replaceAll(/(?is)(E-Chips\sTechnology.+?)(\w+\s\d{2},\s\d{4})(.+?Building.+?Hong Kong)/, { def a, b, c, d -> return b + d + "     " + c })
+        //println(data)
+
+        //data = data.toString().replaceAll(/(?ism)^(.+?Hong)(.+?Kong).+?(?is)(\w+\s\d{2},\s\d{4})/,{def a, b, c, d -> return b + c + "     " + d})
+
+        return data
+    }
+
+    def detectType(def name) {
+        def type = entityType.detectEntityType(name)
+        return type
+    }
+
+    def createEntity(def name, def date, def address, def alias) {
+        def entityType = detectType(name)
+        def entity = context.findEntity(["name": name, "type": entityType])
+        if (entity == null) {
+            entity = context.getSession().newEntity()
+            entity.setName(name)
+            entity.setType(entityType)
+        }
+        if(alias){
+            alias= alias.replaceAll(/(?s)\s+/, " ").trim()
+            alias = alias.replaceAll(/,/," ").trim()
+            alias = alias.replaceAll(/(?s)\s+/, " ").trim()
+            entity.addAlias(alias)
+        }
+
+        ScrapeEvent event = new ScrapeEvent()
+
+        def eventDate = context.parseDate(new StringSource(date), ["dd/MM/yyyy", "MMMMM dd, yyyy"] as String[])
+        event.setDate(eventDate)
+
+
+        address.split("; and").each { ad ->
+            def addrMap = addressParser.parseAddress([text: ad, force_country: true])
+            ScrapeAddress scrapeAddress = addressParser.buildAddress(addrMap, [street_sanitizer: street_sanitizer])
+            if (scrapeAddress) {
+                entity.addAddress(scrapeAddress)
+            }
+        }
+    }
+
+    def fixStreet(def address) {
+        return address.replaceAll(/(?s)\s+/, " ").trim()
+    }
+    def street_sanitizer = { street ->
+        fixStreet(street)
+    }
+}

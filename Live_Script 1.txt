@@ -1,0 +1,294 @@
+package current_scripts
+
+import com.moodys.kyc.textract.http.client.TextractClient
+import com.moodys.kyc.textract.http.model.TextractResponse
+import com.rdc.importer.scrapian.ScrapianContext
+import com.rdc.importer.scrapian.util.ModuleLoader
+import com.rdc.importer.scrapian.model.StringSource
+import com.rdc.scrape.ScrapeAddress
+import com.rdc.scrape.ScrapeEvent
+import retrofit2.http.Url
+
+//import com.opencsv.CSVWriter
+
+context.setup([connectionTimeout: 20000, socketTimeout: 30000, retryCount: 1, multithread: true])
+context.session.encoding = "UTF-8" //change it according to web page's encoding
+context.session.escape = true
+
+
+LiveScriptNew script = new LiveScriptNew(context)
+script.initParsing()
+
+class LiveScriptNew {
+    final ScrapianContext context
+    final addressParser
+    def entityType
+    def moduleLoaderVersion = context.scriptParams.moduleLoaderVersion
+    final def moduleFactory = ModuleLoader.getFactory(moduleLoaderVersion)
+    def url = "https://plb.iowa.gov/disciplinary-index/real-estate-sales-&-brokers"
+    def root = "https://plb.iowa.gov/"
+    def list = []
+
+    LiveScriptNew(context) {
+        this.context = context
+        entityType = moduleFactory.getEntityTypeDetection(context)
+        addressParser = moduleFactory.getGenericAddressParser(context)
+    }
+
+    def initParsing() {
+
+        def html = invokeUrl(url)
+
+//        println(html)
+
+        handleHTML(html)
+
+    }
+
+    def handleHTML(def html) {
+        def lastMatcher = html =~ /(?s)Go to last page.*?\n\d{1,}/
+
+        def flag = false
+
+        def allPdfList = []
+
+        if (lastMatcher.find()) {
+            def j = lastMatcher.group(0).replaceAll(/Go to last page">\n/, "").trim().toInteger()
+            println("j=" + j)
+
+            for (int i = 0; i <= j; i++) {
+
+                if (flag) {
+                    break
+                }
+                
+                def pageregex = html =~ /\?page=/
+
+                if (pageregex.find()) {
+                    def page = pageregex.group(0)
+
+                    println("Page No: " + page)
+
+                    def url2 = url + page + i
+
+                    println("URL two : " + url2)
+                    def html2 = invokeUrl(url2)
+//                    println(html2)
+
+
+                    def pdfRegex2 = html2 =~ /\/sites\/default\/files\/(.+?)\.pdf/
+
+                    while (pdfRegex2.find()) {
+
+                        def pdf2 = pdfRegex2.group(0)
+                        def pdfUrl = root + pdf2
+
+
+                        allPdfList.add(pdfUrl)
+
+//                        println("pdfUrl : " + pdfUrl)
+                        if (pdfUrl.toString().contains("/sites/default/files/20-028%20Abboud%2C%20Mark%20F..pdf")) {
+                            flag = true
+                            break
+                        }
+                    }
+//                println(allPdfList)
+
+                }
+            }
+        }
+        handlePDF(allPdfList)
+    }
+
+    def handlePDF(def allPdfList) {
+
+        //println(allPdfList.size())
+
+        for (int index = 0; index < allPdfList.size() - 1; index++) {
+           // println(allPdfList[index])
+
+            def pdfUrl = allPdfList[index].toString()
+
+            if (pdfUrl.contains("2022")) {
+//                            println("2022== "+pdfUrl)
+                def pdfText = pdfToTextConverter(pdfUrl)
+                def data = pdfText.detectedText
+
+                def pdf2022 = data =~ /(?sm)IN\sRE:.+?(?:RESPONDENT|APPLICANT)\n?\)?/
+
+                def name
+                if (pdf2022.find()) {
+                    def pdf2022Block = pdf2022.group(0)
+
+                    def nameMatcher = pdf2022Block =~ /(?s)CASE\s(NUMBER|NUMBERS):[\s\d-]+(.*?)\)/
+                    if (nameMatcher.find()) {
+                        name = nameMatcher.group(2)
+                        name = name.toString().replaceAll(/, 21-091|, 21-164|, 22-083, 22-084|\/23-091/, "")
+                        //println(name)
+
+                    }
+                    def address
+                    def addressMatcher = pdf2022Block =~ /(?s)\s(\d{3,}.*?)\)[A-Z\s,]*\s+(.*?\d{5})/
+                    if (addressMatcher.find()) {
+                        address = addressMatcher.group(1).toString().trim() + ',' + addressMatcher.group(2).toString().trim()
+//                                    address = address.toString().trim()
+                        //println("this is the address: " + address)
+                    }
+
+                    // println("this is for url 2022: " + pdfUrl)
+
+                    def eventDate = "-/-/2022"
+
+                    println("Entity name for 2022 : " + name)
+
+                    if (name) {
+                        createEntity(name, address, pdfUrl, eventDate)
+                    }
+                }
+            }
+//                            println(data)
+//                            println("========================")
+            if (pdfUrl.contains("2023")) {
+                def pdfText2 = pdfToTextConverter(pdfUrl)
+                def data2 = pdfText2.detectedText
+
+                def pdf2023 = data2 =~ /(?sm)IN\sRE:.+?(?:RESPONDENT|APPLICANT)\n?\)?/
+
+                def name2
+                if (pdf2023.find()) {
+                    def pdf2023Block = pdf2023.group(0)
+
+                    def nameMatcher2 = pdf2023Block =~ /(?s)CASE\s(NUMBER|NUMBERS):[\s\d-]+(.*?)\)/
+                    if (nameMatcher2.find()) {
+                        name2 = nameMatcher2.group(2)
+                        // println(name2)
+                    }
+                    def address2
+                    def addressMatcher2 = pdf2023Block =~ /(?s)\s(\d{3,}.*?)\)[A-Z\s,]*\s+(.*?\d{5})/
+                    if (addressMatcher2.find()) {
+                        address2 = addressMatcher2.group(1).toString().trim() + ',' + addressMatcher2.group(2).toString().trim()
+                        address2 = address2.toString().replaceAll(/^(.+?)$/, '$1, USA')
+                        // println("this is the address: " + address2)
+                    }
+                    //println(address2)
+                    // println("this is for url 2023: " + pdfUrl)
+
+
+                    def eventDate = "-/-/2023"
+
+                    println("Entity name for 2023 : " + name2)
+
+                    if (name2) {
+                        createEntity(name2, address2, pdfUrl, eventDate)
+                    }
+
+                }
+
+            }
+        }
+    }
+
+    def sanitizeName(def name) {
+        name = name.toString().replaceAll(/\/22-293/, '').trim()
+        name = name.toString().replaceAll(/\/23-091/, '').trim()
+
+        return name
+    }
+
+    def sanitizeAddress(def address) {
+        address = address.toString().replaceAll(/(?s)\)\s*AND CONSENT ORDER IN A/, "").trim()
+        address = address.toString().replaceAll(/(?s)1419 W\./, "1419 W,").trim()
+        address = address.toString().replaceAll(/(?s)lowa/, "Iowa").trim()
+        address = address.toString().replaceAll(/(?s),\s/, ",").trim()
+
+        return address
+    }
+
+    def detectEntity(def name) {
+        def type
+        if (name =~ /^\S+$/) {
+            type = "O"
+        } else {
+            type = entityType.detectEntityType(name)
+            if (type.equals("P")) {
+                if (name =~ /(?i)(?:Phamacy|Druggists|Homecare|Neuromedical|Clinic|Medicine|Hearing\s+Aid|Medi\-Screens|Softech|India|Trustee|Forest)/) {
+                    type = "O"
+                }
+            } else if (name =~ /(?i)(?:Christie L|William House|Ben Parker|Margaret Leigh|Philip L|Ashley Nicole|Honey|Logic|Tangella Jackson|Kathy)/) {
+                type = "P"
+            }
+        }
+        return type
+    }
+
+    def createEntity(def name, def address, def Url, def eventDate) {
+
+        name = sanitizeName(name)
+        def entityType = detectEntity(name)
+        def entity = context.findEntity(["name": name, "type": entityType])
+        if (!entity) {
+            entity = context.getSession().newEntity()
+            entity.setName(name)
+            entity.setType(entityType)
+
+
+            // println("this is address: " + address)
+
+            ScrapeEvent event = new ScrapeEvent()
+            if (address) {
+                address = sanitizeAddress(address)
+                address = address + ", USA"
+                def addrMap = addressParser.parseAddress([text: address, force_country: true])
+                ScrapeAddress scrapeAddress = addressParser.buildAddress(addrMap, [street_sanitizer: street_sanitizer])
+                entity.addAddress(scrapeAddress)
+            }
+
+            if (Url) {
+                entity.addUrl(Url)
+            }
+
+            // ScrapeEvent event = new ScrapeEvent()
+            event.setDescription("This entity appears on the Iowa Professional Licensing Board list of Real Estate Disciplinary Actions.")
+
+            if (eventDate) {
+                def sDate = context.parseDate(new StringSource(eventDate), ["-/-/yyyy"] as String[])
+                event.setDate(sDate)
+            }
+
+            event.setCategory("REG")
+            event.setSubcategory("ACT")
+            entity.addEvent(event)
+        }
+    }
+
+
+    def fixStreet(def address) {
+        return address.replaceAll(/(?s)\s+/, " ").trim()
+    }
+    def street_sanitizer = { street ->
+        fixStreet(street)
+    }
+
+//    regex = /(?s)IN\sRE.+?(?:RESPONDENT|APPLICANT)\n?\)?/
+
+    TextractResponse pdfToTextConverter(def pdfUrl) {
+        def pdfFile = invokeBinary(pdfUrl)
+        def bytes = pdfFile.getValue()
+        TextractClient textractClient = new TextractClient(context.getGridDataServiceUrl(), context.getOauth2Username(), context.getOauth2Password(), context.getOauth2Url())
+        TextractResponse text = textractClient.detectDocumentText(bytes)
+        return text
+    }
+
+    def invokeBinary(url, type = null, paramsMap = null, cache = true, clean = true, miscData = [:]) {
+        //Default type is GET
+        Map dataMap = [url: url, type: type, params: paramsMap, clean: clean, cache: cache]
+        dataMap.putAll(miscData)
+        return context.invokeBinary(dataMap)
+    }
+
+    def invokeUrl(url, headersMap = [:], cache = true, tidy = false, miscData = [:]) {
+        Map dataMap = [url: url, tidy: tidy, headers: headersMap, cache: cache]
+        dataMap.putAll(miscData)
+        return context.invoke(dataMap)
+    }
+}
